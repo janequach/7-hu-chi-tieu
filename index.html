@@ -86,6 +86,8 @@ const GD_FILEID_KEY = 'so7hu_gd_fileid';
 const driveSync = {
   tokenClient: null,
   accessToken: null,
+  _findPromise: null,
+  _writeQueue: Promise.resolve(),
 
   loadSavedToken() {
     try {
@@ -166,18 +168,45 @@ const driveSync = {
     return res;
   },
 
-  async findFileId() {
-    const cached = localStorage.getItem(GD_FILEID_KEY);
-    if (cached) return cached;
+  async listAllFiles() {
     const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
-    const res = await this.apiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
+    const res = await this.apiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc`);
     const data = await res.json();
-    if (data.files && data.files.length > 0) {
-      const id = data.files[0].id;
-      localStorage.setItem(GD_FILEID_KEY, id);
-      return id;
-    }
-    return null;
+    return data.files || [];
+  },
+
+  // Đảm bảo chỉ có 1 lệnh tìm/tạo file chạy tại một thời điểm, tránh tạo trùng do gọi đồng thời.
+  async findFileId() {
+    if (this._findPromise) return this._findPromise;
+    this._findPromise = (async () => {
+      try {
+        const files = await this.listAllFiles();
+
+        if (files.length === 0) {
+          localStorage.removeItem(GD_FILEID_KEY);
+          return null;
+        }
+
+        // Nếu có nhiều file trùng tên (do lỗi tạo trùng trước đây), giữ lại
+        // file mới nhất (modifiedTime lớn nhất) và xoá các file thừa.
+        if (files.length > 1) {
+          const keep = files[0]; // đã orderBy modifiedTime desc
+          const toDelete = files.slice(1);
+          await Promise.all(toDelete.map(f =>
+            this.apiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, { method: 'DELETE' }).catch(() => {})
+          ));
+          localStorage.setItem(GD_FILEID_KEY, keep.id);
+          return keep.id;
+        }
+
+        const id = files[0].id;
+        localStorage.setItem(GD_FILEID_KEY, id);
+        return id;
+      } finally {
+        this._findPromise = null;
+      }
+    })();
+    return this._findPromise;
   },
 
   async createFile(content) {
@@ -204,7 +233,14 @@ const driveSync = {
     });
   },
 
-  async uploadData(content) {
+  // Mọi lệnh ghi (upload) được xếp hàng tuần tự (queue), tránh 2 lệnh ghi
+  // chạy chồng nhau cùng không thấy file cũ và cùng tạo file mới.
+  uploadData(content) {
+    this._writeQueue = this._writeQueue.then(() => this._uploadDataInner(content));
+    return this._writeQueue;
+  },
+
+  async _uploadDataInner(content) {
     let fileId = await this.findFileId();
     if (!fileId) {
       fileId = await this.createFile(content);
