@@ -10,6 +10,7 @@
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 
 <style>
   html, body { margin: 0; padding: 0; }
@@ -75,6 +76,153 @@ const storage = {
   },
 };
 
+/* ---------- Google Drive sync ---------- */
+const GOOGLE_CLIENT_ID = '33994633831-081hi0ae2rtsfi5nglvsjg6c9qc142dg.apps.googleusercontent.com';
+const DRIVE_FILE_NAME = 'so-7-hu-data.json';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const GD_TOKEN_KEY = 'so7hu_gd_token';
+const GD_FILEID_KEY = 'so7hu_gd_fileid';
+
+const driveSync = {
+  tokenClient: null,
+  accessToken: null,
+
+  loadSavedToken() {
+    try {
+      const raw = localStorage.getItem(GD_TOKEN_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (data.expiresAt && Date.now() < data.expiresAt) {
+        this.accessToken = data.token;
+        return data.token;
+      }
+    } catch (e) {}
+    return null;
+  },
+
+  saveToken(token, expiresInSec) {
+    this.accessToken = token;
+    try {
+      localStorage.setItem(GD_TOKEN_KEY, JSON.stringify({
+        token,
+        expiresAt: Date.now() + (expiresInSec - 60) * 1000,
+      }));
+    } catch (e) {}
+  },
+
+  clearToken() {
+    this.accessToken = null;
+    try { localStorage.removeItem(GD_TOKEN_KEY); } catch (e) {}
+  },
+
+  ensureTokenClient(callback) {
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+      return false;
+    }
+    if (!this.tokenClient) {
+      this.tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: DRIVE_SCOPE,
+        callback: callback,
+      });
+    } else {
+      this.tokenClient.callback = callback;
+    }
+    return true;
+  },
+
+  signIn() {
+    return new Promise((resolve, reject) => {
+      const ready = this.ensureTokenClient((resp) => {
+        if (resp.error) { reject(resp); return; }
+        this.saveToken(resp.access_token, resp.expires_in || 3500);
+        resolve(resp.access_token);
+      });
+      if (!ready) { reject(new Error('Google Identity Services chưa tải xong')); return; }
+      this.tokenClient.requestAccessToken({ prompt: 'consent' });
+    });
+  },
+
+  signOut() {
+    if (this.accessToken && window.google && window.google.accounts) {
+      window.google.accounts.oauth2.revoke(this.accessToken, () => {});
+    }
+    this.clearToken();
+    try { localStorage.removeItem(GD_FILEID_KEY); } catch (e) {}
+  },
+
+  async apiFetch(url, options = {}) {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        Authorization: `Bearer ${this.accessToken}`,
+      },
+    });
+    if (res.status === 401) {
+      this.clearToken();
+      throw new Error('UNAUTHORIZED');
+    }
+    return res;
+  },
+
+  async findFileId() {
+    const cached = localStorage.getItem(GD_FILEID_KEY);
+    if (cached) return cached;
+    const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+    const res = await this.apiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      const id = data.files[0].id;
+      localStorage.setItem(GD_FILEID_KEY, id);
+      return id;
+    }
+    return null;
+  },
+
+  async createFile(content) {
+    const metadata = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+    const boundary = 'so7hu_boundary';
+    const body =
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+      `--${boundary}\r\nContent-Type: application/json\r\n\r\n${content}\r\n--${boundary}--`;
+    const res = await this.apiFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    });
+    const data = await res.json();
+    if (data.id) localStorage.setItem(GD_FILEID_KEY, data.id);
+    return data.id;
+  },
+
+  async updateFile(fileId, content) {
+    await this.apiFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: content,
+    });
+  },
+
+  async uploadData(content) {
+    let fileId = await this.findFileId();
+    if (!fileId) {
+      fileId = await this.createFile(content);
+    } else {
+      await this.updateFile(fileId, content);
+    }
+    return fileId;
+  },
+
+  async downloadData() {
+    const fileId = await this.findFileId();
+    if (!fileId) return null;
+    const res = await this.apiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+    if (!res.ok) return null;
+    return await res.text();
+  },
+};
+
 const JARS = [
   { key: 'daily', label: 'Chi tiêu hàng ngày', color: '#B45309', bg: '#FEF3E2', ring: '#FDE0B0', isDaily: true },
   { key: 'savings', label: 'Tiết kiệm', percent: 30, color: '#0F6E56', bg: '#E1F5EE', ring: '#9FE1CB' },
@@ -107,12 +255,31 @@ function BudgetApp() {
   const [modal, setModal] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState('idle');
+  const [gdConnected, setGdConnected] = useState(false);
+  const [gdSyncing, setGdSyncing] = useState(false);
+  const [gdError, setGdError] = useState('');
   const saveTimer = useRef(null);
+  const gdSyncTimer = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
+        const hasToken = driveSync.loadSavedToken();
+        if (hasToken) {
+          setGdConnected(true);
+          try {
+            const remote = await driveSync.downloadData();
+            if (remote && !cancelled) {
+              const list = JSON.parse(remote);
+              setTransactions(Array.isArray(list) ? list : []);
+              await storage.set(remote);
+              if (!cancelled) { setLoaded(true); return; }
+            }
+          } catch (e) {
+            // Nếu Drive lỗi (vd token hết hạn), rơi xuống dùng localStorage bên dưới
+          }
+        }
         const result = await storage.get();
         if (!cancelled) {
           const list = result && result.value ? JSON.parse(result.value) : [];
@@ -132,14 +299,62 @@ function BudgetApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        const result = await storage.set(JSON.stringify(transactions));
+        const json = JSON.stringify(transactions);
+        const result = await storage.set(json);
         setSaveState(result ? 'saved' : 'error');
+
+        if (gdConnected && driveSync.accessToken) {
+          if (gdSyncTimer.current) clearTimeout(gdSyncTimer.current);
+          gdSyncTimer.current = setTimeout(async () => {
+            try {
+              setGdSyncing(true);
+              await driveSync.uploadData(json);
+              setGdError('');
+            } catch (e) {
+              if (e.message === 'UNAUTHORIZED') {
+                setGdConnected(false);
+                setGdError('Phiên đăng nhập Google hết hạn, vui lòng đăng nhập lại.');
+              } else {
+                setGdError('Đồng bộ Google Drive thất bại, đã lưu trên máy.');
+              }
+            } finally {
+              setGdSyncing(false);
+            }
+          }, 600);
+        }
       } catch (e) {
         setSaveState('error');
       }
     }, 400);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [transactions, loaded]);
+  }, [transactions, loaded, gdConnected]);
+
+  async function handleGoogleSignIn() {
+    setGdError('');
+    try {
+      await driveSync.signIn();
+      setGdConnected(true);
+      setGdSyncing(true);
+      const remote = await driveSync.downloadData();
+      if (remote) {
+        const list = JSON.parse(remote);
+        setTransactions(Array.isArray(list) ? list : []);
+        await storage.set(remote);
+      } else {
+        await driveSync.uploadData(JSON.stringify(transactions));
+      }
+    } catch (e) {
+      setGdError('Không thể đăng nhập Google. Vui lòng thử lại.');
+    } finally {
+      setGdSyncing(false);
+    }
+  }
+
+  function handleGoogleSignOut() {
+    driveSync.signOut();
+    setGdConnected(false);
+    setGdError('');
+  }
 
   const balances = useMemo(() => {
     const b = {};
@@ -265,12 +480,19 @@ function BudgetApp() {
             </div>
             <div style={styles.headerActions}>
               <SaveIndicator state={saveState} />
+              <GoogleSyncButton
+                connected={gdConnected}
+                syncing={gdSyncing}
+                onSignIn={handleGoogleSignIn}
+                onSignOut={handleGoogleSignOut}
+              />
               <button onClick={exportExcel} style={{ ...styles.exportBtn, ...(transactions.length === 0 ? styles.exportBtnDisabled : {}) }} disabled={transactions.length === 0}>
                 <Icon name="download" size={14} strokeWidth={1.8} />
                 Xuất Excel
               </button>
             </div>
           </div>
+          {gdError && <div style={styles.gdErrorBanner}>{gdError}</div>}
           <div style={styles.totalWrap}>
             <span style={styles.totalLabel}>Tổng số dư</span>
             <span style={styles.totalValue}>{fmt(walletTotal)}</span>
@@ -332,6 +554,38 @@ function SaveIndicator({ state }) {
     return <span style={{ ...styles.saveIndicator, color: '#993C1D' }}>Lưu lỗi, thử lại</span>;
   }
   return null;
+}
+
+function GoogleSyncButton({ connected, syncing, onSignIn, onSignOut }) {
+  if (!connected) {
+    return (
+      <button onClick={onSignIn} style={styles.gdButton}>
+        <GoogleGlyph size={14} />
+        Đăng nhập Google
+      </button>
+    );
+  }
+  return (
+    <button onClick={onSignOut} style={{ ...styles.gdButton, ...styles.gdButtonConnected }}>
+      {syncing ? (
+        <Icon name="loader-2" size={13} strokeWidth={2} style={{ animation: 'spin 1s linear infinite' }} />
+      ) : (
+        <GoogleGlyph size={14} />
+      )}
+      {syncing ? 'Đang đồng bộ' : 'Đã kết nối Drive'}
+    </button>
+  );
+}
+
+function GoogleGlyph({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" style={{ flexShrink: 0 }}>
+      <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/>
+      <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/>
+      <path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.5 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.6 39.6 16.2 44 24 44z"/>
+      <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.1-4.1 5.6l6.2 5.2C40.4 36.3 44 30.8 44 24c0-1.3-.1-2.7-.4-3.5z"/>
+    </svg>
+  );
 }
 
 function TabButton({ icon, label, active, onClick }) {
@@ -720,6 +974,33 @@ const styles = {
   exportBtnDisabled: {
     opacity: 0.45,
     cursor: 'not-allowed',
+  },
+  gdButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '6px 12px',
+    fontSize: 12.5,
+    fontWeight: 500,
+    borderRadius: 999,
+    border: '1px solid #E8E1D3',
+    background: '#fff',
+    color: '#5F5E5A',
+    cursor: 'pointer',
+  },
+  gdButtonConnected: {
+    borderColor: '#9FE1CB',
+    background: '#E1F5EE',
+    color: '#0F6E56',
+  },
+  gdErrorBanner: {
+    fontSize: 12,
+    color: '#993C1D',
+    background: '#FAECE7',
+    border: '1px solid #F0997B',
+    borderRadius: 8,
+    padding: '6px 10px',
+    marginBottom: 10,
   },
   brandText: {
     fontFamily: 'Georgia, "Times New Roman", serif',
