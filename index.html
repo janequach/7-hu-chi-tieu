@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sổ 7 hũ</title>
+
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/lucide@0.383.0/dist/umd/lucide.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #FAF7F0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 640px) {
+    .jarsGrid { grid-template-columns: repeat(2, 1fr) !important; }
+    .summaryGrid { grid-template-columns: 1fr 1fr !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react,env">
+const { useState, useMemo, useEffect, useRef } = React;
+
+/* ---------- Lucide icon wrapper ---------- */
+function toPascalCase(str) {
+  return str.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
+}
+function Icon({ name, size = 16, color = 'currentColor', strokeWidth = 1.8, style }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current && window.lucide && window.lucide.icons) {
+      const key = toPascalCase(name);
+      const iconDef = window.lucide.icons[key];
+      ref.current.innerHTML = iconDef
+        ? iconDef.toSvg({ width: size, height: size, color, 'stroke-width': strokeWidth })
+        : '';
+    }
+  }, [name, size, color, strokeWidth]);
+  return <span ref={ref} style={{ display: 'inline-flex', lineHeight: 0, flexShrink: 0, ...style }} />;
+}
+
+/* ---------- Local storage helpers (replaces window.storage) ---------- */
+const LS_KEY = 'so7hu_transactions';
+const storage = {
+  get: async () => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      return raw ? { value: raw } : null;
+    } catch (e) { return null; }
+  },
+  set: async (value) => {
+    try {
+      localStorage.setItem(LS_KEY, value);
+      return { value };
+    } catch (e) { return null; }
+  },
+};
+
+const JARS = [
+  { key: 'daily', label: 'Chi tiêu hàng ngày', color: '#B45309', bg: '#FEF3E2', ring: '#FDE0B0', isDaily: true },
+  { key: 'savings', label: 'Tiết kiệm', percent: 30, color: '#0F6E56', bg: '#E1F5EE', ring: '#9FE1CB' },
+  { key: 'invest', label: 'Đầu tư bản thân', percent: 30, color: '#185FA5', bg: '#E6F1FB', ring: '#85B7EB' },
+  { key: 'family', label: 'Ma chay cưới hỏi', percent: 15, color: '#993556', bg: '#FBEAF0', ring: '#ED93B1' },
+  { key: 'spend', label: 'Chi tiêu', percent: 20, color: '#993C1D', bg: '#FAECE7', ring: '#F0997B' },
+  { key: 'charity', label: 'Từ thiện', percent: 5, color: '#534AB7', bg: '#EEEDFE', ring: '#AFA9EC' },
+  { key: 'other', label: 'Khác', color: '#5F5E5A', bg: '#F1EFE8', ring: '#B4B2A9', isTotal: true },
+];
+
+const INCOME_SOURCES = ['Lương', 'Thưởng', 'Làm thêm', 'Khác'];
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+function fmt(n) {
+  const v = Math.round(n || 0);
+  return v.toLocaleString('vi-VN') + 'đ';
+}
+function todayStr() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+function monthKey(dateStr) { return dateStr.slice(0, 7); }
+function yearKey(dateStr) { return dateStr.slice(0, 4); }
+
+function BudgetApp() {
+  const [transactions, setTransactions] = useState([]);
+  const [tab, setTab] = useState('home');
+  const [modal, setModal] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [saveState, setSaveState] = useState('idle');
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await storage.get();
+        if (!cancelled) {
+          const list = result && result.value ? JSON.parse(result.value) : [];
+          setTransactions(Array.isArray(list) ? list : []);
+        }
+      } catch (e) {
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    setSaveState('saving');
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const result = await storage.set(JSON.stringify(transactions));
+        setSaveState(result ? 'saved' : 'error');
+      } catch (e) {
+        setSaveState('error');
+      }
+    }, 400);
+    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
+  }, [transactions, loaded]);
+
+  const balances = useMemo(() => {
+    const b = {};
+    JARS.forEach(j => (b[j.key] = 0));
+    transactions.forEach(t => {
+      if (t.type === 'income') {
+        Object.entries(t.allocations).forEach(([k, v]) => {
+          b[k] = (b[k] || 0) + v;
+        });
+      } else {
+        b[t.jar] = (b[t.jar] || 0) - t.amount;
+      }
+    });
+    return b;
+  }, [transactions]);
+
+  const walletTotal = (balances.daily || 0) + (balances.savings || 0) + (balances.invest || 0) + (balances.family || 0) + (balances.spend || 0) + (balances.charity || 0);
+
+  function addIncome({ source, customLabel, amount, dailyAmount, date, note }) {
+    const total = amount;
+    const daily = Math.min(dailyAmount, total);
+    const rest = total - daily;
+    const allocations = {
+      daily: daily,
+      other: rest,
+      savings: rest * 0.3,
+      invest: rest * 0.3,
+      family: rest * 0.15,
+      spend: rest * 0.2,
+      charity: rest * 0.05,
+    };
+    const tx = {
+      id: uid(),
+      type: 'income',
+      source: source === 'Khác' ? (customLabel || 'Khác') : source,
+      amount: total,
+      date,
+      note,
+      allocations,
+    };
+    setTransactions(prev => [tx, ...prev]);
+  }
+
+  function addExpense({ jar, amount, date, note }) {
+    const tx = { id: uid(), type: 'expense', jar, amount, date, note };
+    setTransactions(prev => [tx, ...prev]);
+  }
+
+  function removeTx(id) {
+    setTransactions(prev => prev.filter(t => t.id !== id));
+  }
+
+  function exportExcel() {
+    const jarLabel = (key) => JARS.find(j => j.key === key)?.label || key;
+
+    const txRows = [...transactions]
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+      .map(t => ({
+        'Ngày': formatDateVN(t.date),
+        'Loại': t.type === 'income' ? 'Thu nhập' : 'Chi tiêu',
+        'Nguồn / Hũ': t.type === 'income' ? t.source : jarLabel(t.jar),
+        'Số tiền': t.amount,
+        'Ghi chú': t.note || '',
+      }));
+
+    const jarRows = JARS.map(j => ({
+      'Hũ': j.label,
+      'Tỉ lệ': j.percent ? `${j.percent}%` : '',
+      'Số dư hiện tại': Math.round(balances[j.key] || 0),
+    }));
+
+    const monthMap = {};
+    transactions.forEach(t => {
+      const k = monthKey(t.date);
+      if (!monthMap[k]) monthMap[k] = { income: 0, expense: 0 };
+      if (t.type === 'income') monthMap[k].income += t.amount; else monthMap[k].expense += t.amount;
+    });
+    const monthRows = Object.entries(monthMap)
+      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+      .map(([k, v]) => ({
+        'Tháng': formatGroupKey(k, 'month'),
+        'Thu nhập': Math.round(v.income),
+        'Chi tiêu': Math.round(v.expense),
+        'Chênh lệch': Math.round(v.income - v.expense),
+      }));
+
+    const wb = XLSX.utils.book_new();
+    const wsTx = XLSX.utils.json_to_sheet(txRows);
+    wsTx['!cols'] = [{ wch: 12 }, { wch: 10 }, { wch: 22 }, { wch: 14 }, { wch: 30 }];
+    XLSX.utils.book_append_sheet(wb, wsTx, 'Giao dịch');
+
+    const wsJar = XLSX.utils.json_to_sheet(jarRows);
+    wsJar['!cols'] = [{ wch: 22 }, { wch: 8 }, { wch: 16 }];
+    XLSX.utils.book_append_sheet(wb, wsJar, 'Số dư các hũ');
+
+    const wsMonth = XLSX.utils.json_to_sheet(monthRows);
+    wsMonth['!cols'] = [{ wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+    XLSX.utils.book_append_sheet(wb, wsMonth, 'Tổng hợp theo tháng');
+
+    const today = todayStr();
+    XLSX.writeFile(wb, `so-7-hu-${today}.xlsx`);
+  }
+
+  if (!loaded) {
+    return (
+      <div style={{ ...styles.app, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 400 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, color: '#8A8478' }}>
+          <Icon name="loader-2" size={24} strokeWidth={1.8} style={{ animation: 'spin 1s linear infinite' }} />
+          <span style={{ fontSize: 13 }}>Đang tải dữ liệu đã lưu...</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.app}>
+      <header style={styles.header}>
+        <div style={styles.headerInner}>
+          <div style={styles.brandRow}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Icon name="wallet" size={22} color="#B45309" strokeWidth={1.8} />
+              <span style={styles.brandText}>Sổ 7 hũ</span>
+            </div>
+            <div style={styles.headerActions}>
+              <SaveIndicator state={saveState} />
+              <button onClick={exportExcel} style={{ ...styles.exportBtn, ...(transactions.length === 0 ? styles.exportBtnDisabled : {}) }} disabled={transactions.length === 0}>
+                <Icon name="download" size={14} strokeWidth={1.8} />
+                Xuất Excel
+              </button>
+            </div>
+          </div>
+          <div style={styles.totalWrap}>
+            <span style={styles.totalLabel}>Tổng số dư</span>
+            <span style={styles.totalValue}>{fmt(walletTotal)}</span>
+          </div>
+        </div>
+      </header>
+
+      <nav style={styles.tabBar}>
+        <TabButton icon={<Icon name="wallet" size={16} strokeWidth={1.8} />} label="Hũ tiền" active={tab === 'home'} onClick={() => setTab('home')} />
+        <TabButton icon={<Icon name="calendar" size={16} strokeWidth={1.8} />} label="Lịch sử" active={tab === 'history'} onClick={() => setTab('history')} />
+        <TabButton icon={<Icon name="bar-chart-3" size={16} strokeWidth={1.8} />} label="Tổng hợp" active={tab === 'summary'} onClick={() => setTab('summary')} />
+      </nav>
+
+      <main style={styles.main}>
+        {tab === 'home' && <HomeView balances={balances} />}
+        {tab === 'history' && <HistoryView transactions={transactions} onRemove={removeTx} />}
+        {tab === 'summary' && <SummaryView transactions={transactions} />}
+      </main>
+
+      <div style={styles.fabRow}>
+        <button style={{ ...styles.fab, ...styles.fabExpense }} onClick={() => setModal('expense')}>
+          <Icon name="minus-circle" size={18} strokeWidth={2} />
+          Chi tiêu
+        </button>
+        <button style={{ ...styles.fab, ...styles.fabIncome }} onClick={() => setModal('income')}>
+          <Icon name="plus-circle" size={18} strokeWidth={2} />
+          Thu nhập
+        </button>
+      </div>
+
+      {modal === 'income' && (
+        <IncomeModal onClose={() => setModal(null)} onSubmit={(data) => { addIncome(data); setModal(null); }} />
+      )}
+      {modal === 'expense' && (
+        <ExpenseModal balances={balances} onClose={() => setModal(null)} onSubmit={(data) => { addExpense(data); setModal(null); }} />
+      )}
+    </div>
+  );
+}
+
+function SaveIndicator({ state }) {
+  if (state === 'saving') {
+    return (
+      <span style={styles.saveIndicator}>
+        <Icon name="loader-2" size={12} strokeWidth={2} style={{ animation: 'spin 1s linear infinite' }} />
+        Đang lưu
+      </span>
+    );
+  }
+  if (state === 'saved') {
+    return (
+      <span style={{ ...styles.saveIndicator, color: '#0F6E56' }}>
+        <Icon name="check" size={12} strokeWidth={2} />
+        Đã lưu
+      </span>
+    );
+  }
+  if (state === 'error') {
+    return <span style={{ ...styles.saveIndicator, color: '#993C1D' }}>Lưu lỗi, thử lại</span>;
+  }
+  return null;
+}
+
+function TabButton({ icon, label, active, onClick }) {
+  return (
+    <button onClick={onClick} style={{ ...styles.tabBtn, ...(active ? styles.tabBtnActive : {}) }}>
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function HomeView({ balances }) {
+  return (
+    <div>
+      <div className="jarsGrid" style={styles.jarsGrid}>
+        {JARS.map(j => (
+          <div key={j.key} style={{ ...styles.jarCard, background: j.bg, borderColor: j.ring }}>
+            <div style={{ ...styles.jarDot, background: j.color }} />
+            <div style={styles.jarLabel}>{j.label}</div>
+            {j.percent ? <div style={styles.jarPercent}>{j.percent}% phần "Khác"</div> : <div style={styles.jarPercent}>&nbsp;</div>}
+            <div style={{ ...styles.jarAmount, color: j.color }}>{fmt(balances[j.key])}</div>
+          </div>
+        ))}
+      </div>
+      <p style={styles.hint}>
+        Hũ "Khác" = Thu nhập − Chi tiêu hàng ngày đã khai báo. 5 hũ Tiết kiệm, Đầu tư, Ma chay, Chi tiêu, Từ thiện được chia ra từ hũ "Khác" theo tỉ lệ cố định.
+      </p>
+    </div>
+  );
+}
+
+function HistoryView({ transactions, onRemove }) {
+  if (transactions.length === 0) {
+    return <EmptyState text="Chưa có giao dịch nào. Nhấn “Thu nhập” hoặc “Chi tiêu” bên dưới để bắt đầu." />;
+  }
+  const sorted = [...transactions].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  const groups = {};
+  sorted.forEach(t => {
+    groups[t.date] = groups[t.date] || [];
+    groups[t.date].push(t);
+  });
+
+  return (
+    <div>
+      {Object.entries(groups).map(([date, txs]) => (
+        <div key={date} style={{ marginBottom: '1.5rem' }}>
+          <div style={styles.dateHeader}>{formatDateVN(date)}</div>
+          {txs.map(t => (
+            <div key={t.id} style={styles.txRow}>
+              <div style={{ ...styles.txIcon, background: t.type === 'income' ? '#E1F5EE' : '#FAECE7', color: t.type === 'income' ? '#0F6E56' : '#993C1D' }}>
+                {t.type === 'income' ? <Icon name="plus-circle" size={16} strokeWidth={2} /> : <Icon name="minus-circle" size={16} strokeWidth={2} />}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={styles.txTitle}>
+                  {t.type === 'income' ? t.source : JARS.find(j => j.key === t.jar)?.label}
+                </div>
+                {t.note ? <div style={styles.txNote}>{t.note}</div> : null}
+              </div>
+              <div style={{ ...styles.txAmount, color: t.type === 'income' ? '#0F6E56' : '#993C1D' }}>
+                {t.type === 'income' ? '+' : '−'}{fmt(t.amount)}
+              </div>
+              <button aria-label="Xoá giao dịch" onClick={() => onRemove(t.id)} style={styles.txDelete}>
+                <Icon name="trash-2" size={15} strokeWidth={1.8} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SummaryView({ transactions }) {
+  const [mode, setMode] = useState('month');
+
+  const grouped = useMemo(() => {
+    const map = {};
+    transactions.forEach(t => {
+      const key = mode === 'day' ? t.date : mode === 'month' ? monthKey(t.date) : yearKey(t.date);
+      if (!map[key]) map[key] = { income: 0, expense: 0 };
+      if (t.type === 'income') map[key].income += t.amount;
+      else map[key].expense += t.amount;
+    });
+    return Object.entries(map).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [transactions, mode]);
+
+  if (transactions.length === 0) {
+    return <EmptyState text="Chưa có dữ liệu để tổng hợp. Hãy nhập thu nhập hoặc chi tiêu trước." />;
+  }
+
+  return (
+    <div>
+      <div style={styles.modeRow}>
+        {[['day', 'Theo ngày'], ['month', 'Theo tháng'], ['year', 'Theo năm']].map(([k, label]) => (
+          <button key={k} onClick={() => setMode(k)} style={{ ...styles.modeBtn, ...(mode === k ? styles.modeBtnActive : {}) }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {grouped.map(([key, vals]) => {
+        const net = vals.income - vals.expense;
+        const max = Math.max(vals.income, vals.expense, 1);
+        return (
+          <div key={key} style={styles.summaryCard}>
+            <div style={styles.summaryHeader}>
+              <span style={styles.summaryKey}>{formatGroupKey(key, mode)}</span>
+              <span style={{ ...styles.summaryNet, color: net >= 0 ? '#0F6E56' : '#993C1D' }}>
+                {net >= 0 ? '+' : ''}{fmt(net)}
+              </span>
+            </div>
+            <div className="summaryGrid" style={styles.summaryGrid}>
+              <div>
+                <div style={styles.barLabel}>
+                  <Icon name="trending-up" size={13} strokeWidth={1.8} color="#0F6E56" />
+                  <span>Thu nhập</span>
+                </div>
+                <div style={styles.barTrack}>
+                  <div style={{ ...styles.barFill, width: `${(vals.income / max) * 100}%`, background: '#5DCAA5' }} />
+                </div>
+                <div style={styles.barValue}>{fmt(vals.income)}</div>
+              </div>
+              <div>
+                <div style={styles.barLabel}>
+                  <Icon name="trending-up" size={13} strokeWidth={1.8} color="#993C1D" style={{ transform: 'rotate(180deg)' }} />
+                  <span>Chi tiêu</span>
+                </div>
+                <div style={styles.barTrack}>
+                  <div style={{ ...styles.barFill, width: `${(vals.expense / max) * 100}%`, background: '#F0997B' }} />
+                </div>
+                <div style={styles.barValue}>{fmt(vals.expense)}</div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function EmptyState({ text }) {
+  return (
+    <div style={styles.emptyState}>
+      <Icon name="wallet" size={32} strokeWidth={1.3} color="#B4B2A9" />
+      <p style={styles.emptyText}>{text}</p>
+    </div>
+  );
+}
+
+function IncomeModal({ onClose, onSubmit }) {
+  const [source, setSource] = useState('Lương');
+  const [customLabel, setCustomLabel] = useState('');
+  const [amount, setAmount] = useState('');
+  const [dailyAmount, setDailyAmount] = useState('');
+  const [date, setDate] = useState(todayStr());
+  const [note, setNote] = useState('');
+  const [error, setError] = useState('');
+
+  const amt = parseFloat(amount) || 0;
+  const daily = parseFloat(dailyAmount) || 0;
+  const rest = Math.max(amt - daily, 0);
+
+  function handleSubmit() {
+    if (amt <= 0) { setError('Vui lòng nhập số tiền thu nhập lớn hơn 0.'); return; }
+    if (daily > amt) { setError('Chi tiêu hàng ngày không được lớn hơn thu nhập.'); return; }
+    onSubmit({ source, customLabel, amount: amt, dailyAmount: daily, date, note });
+  }
+
+  return (
+    <ModalShell title="Thêm thu nhập" onClose={onClose} accent="#0F6E56">
+      <div>
+        <Field label="Nguồn thu nhập">
+          <div style={styles.chipRow}>
+            {INCOME_SOURCES.map(s => (
+              <button type="button" key={s} onClick={() => setSource(s)} style={{ ...styles.chip, ...(source === s ? styles.chipActiveIncome : {}) }}>
+                {s}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        {source === 'Khác' && (
+          <Field label="Ghi rõ nguồn">
+            <input type="text" value={customLabel} onChange={e => setCustomLabel(e.target.value)} placeholder="Ví dụ: tiền cho thuê nhà" style={styles.input} />
+          </Field>
+        )}
+
+        <Field label="Ngày nhận">
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={styles.input} />
+        </Field>
+
+        <Field label="Số tiền thu nhập">
+          <input type="number" inputMode="numeric" min="0" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0" style={styles.input} />
+        </Field>
+
+        <Field label="Chi tiêu hàng ngày dự kiến (trừ trước khỏi thu nhập)">
+          <input type="number" inputMode="numeric" min="0" value={dailyAmount} onChange={e => setDailyAmount(e.target.value)} placeholder="0" style={styles.input} />
+        </Field>
+
+        <Field label="Ghi chú (tuỳ chọn)">
+          <input type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="Ví dụ: lương tháng 6" style={styles.input} />
+        </Field>
+
+        {amt > 0 && (
+          <div style={styles.previewBox}>
+            <div style={styles.previewTitle}>Phân bổ dự kiến</div>
+            <PreviewRow label="Chi tiêu hàng ngày" value={daily} color="#B45309" />
+            <PreviewRow label="Khác (còn lại)" value={rest} color="#5F5E5A" bold />
+            <PreviewRow label="— Tiết kiệm (30%)" value={rest * 0.3} color="#0F6E56" indent />
+            <PreviewRow label="— Đầu tư bản thân (30%)" value={rest * 0.3} color="#185FA5" indent />
+            <PreviewRow label="— Ma chay cưới hỏi (15%)" value={rest * 0.15} color="#993556" indent />
+            <PreviewRow label="— Chi tiêu (20%)" value={rest * 0.2} color="#993C1D" indent />
+            <PreviewRow label="— Từ thiện (5%)" value={rest * 0.05} color="#534AB7" indent />
+          </div>
+        )}
+
+        {error && <div style={styles.errorText}>{error}</div>}
+
+        <button type="button" onClick={handleSubmit} style={{ ...styles.submitBtn, background: '#0F6E56' }}>Lưu thu nhập</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function ExpenseModal({ balances, onClose, onSubmit }) {
+  const [jar, setJar] = useState('daily');
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayStr());
+  const [note, setNote] = useState('');
+  const [error, setError] = useState('');
+
+  const amt = parseFloat(amount) || 0;
+  const jarInfo = JARS.find(j => j.key === jar);
+  const currentBalance = balances[jar] || 0;
+  const willBeNegative = amt > currentBalance;
+
+  function handleSubmit() {
+    if (amt <= 0) { setError('Vui lòng nhập số tiền chi tiêu lớn hơn 0.'); return; }
+    onSubmit({ jar, amount: amt, date, note });
+  }
+
+  return (
+    <ModalShell title="Thêm chi tiêu" onClose={onClose} accent="#993C1D">
+      <div>
+        <Field label="Rút từ hũ nào">
+          <div style={styles.jarSelectGrid}>
+            {JARS.map(j => (
+              <button type="button" key={j.key} onClick={() => setJar(j.key)}
+                style={{ ...styles.jarSelectBtn, borderColor: jar === j.key ? j.color : j.ring, background: jar === j.key ? j.bg : '#fff' }}>
+                <span style={{ ...styles.jarSelectDot, background: j.color }} />
+                <span style={styles.jarSelectLabel}>{j.label}</span>
+                <span style={{ ...styles.jarSelectBalance, color: j.color }}>{fmt(balances[j.key])}</span>
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        <Field label="Ngày chi">
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={styles.input} />
+        </Field>
+
+        <Field label="Số tiền chi tiêu">
+          <input type="number" inputMode="numeric" min="0" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0" style={styles.input} />
+        </Field>
+
+        <Field label="Ghi chú (tuỳ chọn)">
+          <input type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="Ví dụ: ăn trưa, xăng xe" style={styles.input} />
+        </Field>
+
+        {amt > 0 && (
+          <div style={{ ...styles.previewBox, borderColor: willBeNegative ? '#F0997B' : jarInfo.ring }}>
+            <PreviewRow label={`Số dư hũ "${jarInfo.label}" hiện tại`} value={currentBalance} color={jarInfo.color} />
+            <PreviewRow label="Sau khi chi" value={currentBalance - amt} color={willBeNegative ? '#993C1D' : jarInfo.color} bold />
+            {willBeNegative && <div style={styles.warnText}>Hũ này sẽ bị âm sau giao dịch. Bạn vẫn có thể tiếp tục lưu nếu muốn.</div>}
+          </div>
+        )}
+
+        {error && <div style={styles.errorText}>{error}</div>}
+
+        <button type="button" onClick={handleSubmit} style={{ ...styles.submitBtn, background: '#993C1D' }}>Lưu chi tiêu</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function ModalShell({ title, accent, onClose, children }) {
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modalCard} onClick={e => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <h2 style={{ ...styles.modalTitle, color: accent }}>{title}</h2>
+          <button aria-label="Đóng" onClick={onClose} style={styles.closeBtn}><Icon name="x" size={18} strokeWidth={1.8} /></button>
+        </div>
+        <div style={styles.modalBody}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={styles.field}>
+      <label style={styles.fieldLabel}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function PreviewRow({ label, value, color, bold, indent }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', paddingLeft: indent ? 12 : 0 }}>
+      <span style={{ fontSize: 13, color: '#5F5E5A', fontWeight: bold ? 500 : 400 }}>{label}</span>
+      <span style={{ fontSize: 13, color, fontWeight: bold ? 500 : 400 }}>{fmt(value)}</span>
+    </div>
+  );
+}
+
+function formatDateVN(dateStr) {
+  const [y, m, d] = dateStr.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function formatGroupKey(key, mode) {
+  if (mode === 'day') {
+    const [y, m, d] = key.split('-');
+    return `${d}/${m}/${y}`;
+  }
+  if (mode === 'month') {
+    const [y, m] = key.split('-');
+    return `Tháng ${parseInt(m)}/${y}`;
+  }
+  return `Năm ${key}`;
+}
+
+const styles = {
+  app: {
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    background: '#FAF7F0',
+    minHeight: '100vh',
+    color: '#2C2C2A',
+    paddingBottom: 90,
+  },
+  header: {
+    background: '#FAF7F0',
+    borderBottom: '1px solid #E8E1D3',
+    position: 'sticky',
+    top: 0,
+    zIndex: 5,
+  },
+  headerInner: {
+    maxWidth: 720,
+    margin: '0 auto',
+    padding: '18px 20px 16px',
+  },
+  brandRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  headerActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  saveIndicator: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 12,
+    color: '#8A8478',
+  },
+  exportBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '6px 12px',
+    fontSize: 12.5,
+    fontWeight: 500,
+    borderRadius: 999,
+    border: '1px solid #E8E1D3',
+    background: '#fff',
+    color: '#5F5E5A',
+    cursor: 'pointer',
+  },
+  exportBtnDisabled: {
+    opacity: 0.45,
+    cursor: 'not-allowed',
+  },
+  brandText: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: 19,
+    fontWeight: 700,
+    color: '#3C2E1F',
+    letterSpacing: '-0.01em',
+  },
+  totalWrap: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+  },
+  totalLabel: {
+    fontSize: 12,
+    color: '#8A8478',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+  },
+  totalValue: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: 34,
+    fontWeight: 700,
+    color: '#3C2E1F',
+  },
+  tabBar: {
+    display: 'flex',
+    maxWidth: 720,
+    margin: '0 auto',
+    padding: '0 20px',
+    gap: 4,
+    borderBottom: '1px solid #E8E1D3',
+  },
+  tabBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '10px 14px',
+    fontSize: 14,
+    color: '#8A8478',
+    background: 'none',
+    border: 'none',
+    borderBottom: '2px solid transparent',
+    cursor: 'pointer',
+    fontWeight: 500,
+  },
+  tabBtnActive: {
+    color: '#B45309',
+    borderBottom: '2px solid #B45309',
+  },
+  main: {
+    maxWidth: 720,
+    margin: '0 auto',
+    padding: '20px',
+  },
+  jarsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: 12,
+  },
+  jarCard: {
+    border: '1px solid',
+    borderRadius: 14,
+    padding: '14px 14px 16px',
+    position: 'relative',
+  },
+  jarDot: {
+    width: 8,
+    height: 8,
+    borderRadius: '50%',
+    marginBottom: 8,
+  },
+  jarLabel: {
+    fontSize: 13,
+    fontWeight: 500,
+    color: '#3C2E1F',
+    marginBottom: 2,
+    lineHeight: 1.3,
+  },
+  jarPercent: {
+    fontSize: 11,
+    color: '#8A8478',
+    marginBottom: 10,
+  },
+  jarAmount: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: 18,
+    fontWeight: 700,
+  },
+  hint: {
+    fontSize: 12.5,
+    color: '#8A8478',
+    marginTop: 16,
+    lineHeight: 1.6,
+  },
+  fabRow: {
+    position: 'sticky',
+    bottom: 0,
+    display: 'flex',
+    gap: 10,
+    maxWidth: 720,
+    margin: '0 auto',
+    padding: '12px 20px 20px',
+    background: 'linear-gradient(to top, #FAF7F0 60%, transparent)',
+  },
+  fab: {
+    flex: 1,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    padding: '13px 0',
+    borderRadius: 12,
+    border: 'none',
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: 'pointer',
+    boxShadow: '0 4px 14px rgba(0,0,0,0.12)',
+  },
+  fabExpense: { background: '#993C1D' },
+  fabIncome: { background: '#0F6E56' },
+  dateHeader: {
+    fontSize: 12.5,
+    fontWeight: 500,
+    color: '#8A8478',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    marginBottom: 8,
+    marginTop: 4,
+  },
+  txRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    background: '#fff',
+    border: '1px solid #E8E1D3',
+    borderRadius: 12,
+    padding: '10px 12px',
+    marginBottom: 8,
+  },
+  txIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: '50%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  txTitle: {
+    fontSize: 14,
+    fontWeight: 500,
+    color: '#2C2C2A',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  txNote: {
+    fontSize: 12.5,
+    color: '#8A8478',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  txAmount: {
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    flexShrink: 0,
+  },
+  txDelete: {
+    background: 'none',
+    border: 'none',
+    color: '#B4B2A9',
+    cursor: 'pointer',
+    padding: 4,
+    flexShrink: 0,
+  },
+  modeRow: {
+    display: 'flex',
+    gap: 6,
+    marginBottom: 16,
+  },
+  modeBtn: {
+    padding: '7px 14px',
+    fontSize: 13,
+    borderRadius: 999,
+    border: '1px solid #E8E1D3',
+    background: '#fff',
+    color: '#8A8478',
+    cursor: 'pointer',
+    fontWeight: 500,
+  },
+  modeBtnActive: {
+    background: '#3C2E1F',
+    borderColor: '#3C2E1F',
+    color: '#fff',
+  },
+  summaryCard: {
+    background: '#fff',
+    border: '1px solid #E8E1D3',
+    borderRadius: 14,
+    padding: '14px 16px',
+    marginBottom: 12,
+  },
+  summaryHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: 12,
+  },
+  summaryKey: {
+    fontSize: 14,
+    fontWeight: 500,
+    color: '#3C2E1F',
+  },
+  summaryNet: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: 17,
+    fontWeight: 700,
+  },
+  summaryGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 16,
+  },
+  barLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    fontSize: 12,
+    color: '#8A8478',
+    marginBottom: 5,
+  },
+  barTrack: {
+    height: 6,
+    background: '#F1EFE8',
+    borderRadius: 999,
+    overflow: 'hidden',
+    marginBottom: 4,
+  },
+  barFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  barValue: {
+    fontSize: 13,
+    fontWeight: 500,
+    color: '#3C2E1F',
+  },
+  emptyState: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '60px 20px',
+    textAlign: 'center',
+    gap: 12,
+  },
+  emptyText: {
+    fontSize: 14,
+    color: '#8A8478',
+    maxWidth: 280,
+    lineHeight: 1.6,
+  },
+  modalOverlay: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(44,44,42,0.45)',
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    zIndex: 50,
+  },
+  modalCard: {
+    background: '#FAF7F0',
+    borderRadius: '20px 20px 0 0',
+    width: '100%',
+    maxWidth: 480,
+    maxHeight: '88vh',
+    overflowY: 'auto',
+    boxShadow: '0 -4px 24px rgba(0,0,0,0.18)',
+  },
+  modalHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '18px 20px 12px',
+    position: 'sticky',
+    top: 0,
+    background: '#FAF7F0',
+  },
+  modalTitle: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: 20,
+    fontWeight: 700,
+    margin: 0,
+  },
+  closeBtn: {
+    background: '#F1EFE8',
+    border: 'none',
+    borderRadius: '50%',
+    width: 30,
+    height: 30,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    color: '#5F5E5A',
+  },
+  modalBody: {
+    padding: '4px 20px 24px',
+  },
+  field: {
+    marginBottom: 16,
+  },
+  fieldLabel: {
+    display: 'block',
+    fontSize: 13,
+    fontWeight: 500,
+    color: '#5F5E5A',
+    marginBottom: 7,
+  },
+  input: {
+    width: '100%',
+    padding: '11px 12px',
+    fontSize: 15,
+    border: '1px solid #E8E1D3',
+    borderRadius: 10,
+    background: '#fff',
+    color: '#2C2C2A',
+    outline: 'none',
+  },
+  chipRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  chip: {
+    padding: '8px 14px',
+    fontSize: 13.5,
+    borderRadius: 999,
+    border: '1px solid #E8E1D3',
+    background: '#fff',
+    color: '#5F5E5A',
+    cursor: 'pointer',
+    fontWeight: 500,
+  },
+  chipActiveIncome: {
+    background: '#0F6E56',
+    borderColor: '#0F6E56',
+    color: '#fff',
+  },
+  jarSelectGrid: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  jarSelectBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 12px',
+    borderRadius: 10,
+    border: '1px solid',
+    cursor: 'pointer',
+    textAlign: 'left',
+  },
+  jarSelectDot: {
+    width: 8,
+    height: 8,
+    borderRadius: '50%',
+    flexShrink: 0,
+  },
+  jarSelectLabel: {
+    flex: 1,
+    fontSize: 13.5,
+    fontWeight: 500,
+    color: '#2C2C2A',
+  },
+  jarSelectBalance: {
+    fontSize: 13,
+    fontWeight: 500,
+  },
+  previewBox: {
+    background: '#fff',
+    border: '1px solid #E8E1D3',
+    borderRadius: 10,
+    padding: '12px 14px',
+    marginBottom: 16,
+  },
+  previewTitle: {
+    fontSize: 12,
+    fontWeight: 500,
+    color: '#8A8478',
+    textTransform: 'uppercase',
+    letterSpacing: '0.03em',
+    marginBottom: 6,
+  },
+  warnText: {
+    fontSize: 12.5,
+    color: '#993C1D',
+    marginTop: 6,
+    lineHeight: 1.5,
+  },
+  errorText: {
+    fontSize: 13,
+    color: '#993C1D',
+    marginBottom: 12,
+    padding: '8px 12px',
+    background: '#FAECE7',
+    borderRadius: 8,
+  },
+  submitBtn: {
+    width: '100%',
+    padding: '14px 0',
+    border: 'none',
+    borderRadius: 12,
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: 'pointer',
+    marginTop: 4,
+  },
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<BudgetApp />);
+</script>
+</body>
+</html>
