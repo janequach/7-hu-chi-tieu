@@ -266,8 +266,11 @@ const JARS = [
   { key: 'family', label: 'Ma chay cưới hỏi', percent: 15, color: '#993556', bg: '#FBEAF0', ring: '#ED93B1' },
   { key: 'spend', label: 'Chi tiêu', percent: 20, color: '#993C1D', bg: '#FAECE7', ring: '#F0997B' },
   { key: 'charity', label: 'Từ thiện', percent: 5, color: '#534AB7', bg: '#EEEDFE', ring: '#AFA9EC' },
-  { key: 'other', label: 'Khác', color: '#5F5E5A', bg: '#F1EFE8', ring: '#B4B2A9', isTotal: true },
+  { key: 'other', label: 'Khác', color: '#5F5E5A', bg: '#F1EFE8', ring: '#B4B2A9', isTotal: true, hidden: true },
 ];
+
+// Các hũ hiển thị ra giao diện (bỏ hũ "Khác")
+const VISIBLE_JARS = JARS.filter(j => !j.hidden);
 
 const INCOME_SOURCES = ['Lương', 'Thưởng', 'Làm thêm', 'Khác'];
 
@@ -409,12 +412,12 @@ function BudgetApp() {
 
   const walletTotal = (balances.daily || 0) + (balances.savings || 0) + (balances.invest || 0) + (balances.family || 0) + (balances.spend || 0) + (balances.charity || 0);
 
-  function addIncome({ source, customLabel, amount, dailyAmount, date, note }) {
+  function addIncome({ source, customLabel, amount, dailyAmount, date, note, _allocations }) {
     const total = amount;
     const daily = Math.min(dailyAmount, total);
     const rest = total - daily;
-    const allocations = {
-      daily: daily,
+    const allocations = _allocations || {
+      daily,
       other: rest,
       savings: rest * 0.3,
       invest: rest * 0.3,
@@ -456,7 +459,7 @@ function BudgetApp() {
         'Ghi chú': t.note || '',
       }));
 
-    const jarRows = JARS.map(j => ({
+    const jarRows = VISIBLE_JARS.map(j => ({
       'Hũ': j.label,
       'Tỉ lệ': j.percent ? `${j.percent}%` : '',
       'Số dư hiện tại': Math.round(balances[j.key] || 0),
@@ -637,17 +640,17 @@ function HomeView({ balances }) {
   return (
     <div>
       <div className="jarsGrid" style={styles.jarsGrid}>
-        {JARS.map(j => (
+        {VISIBLE_JARS.map(j => (
           <div key={j.key} style={{ ...styles.jarCard, background: j.bg, borderColor: j.ring }}>
             <div style={{ ...styles.jarDot, background: j.color }} />
             <div style={styles.jarLabel}>{j.label}</div>
-            {j.percent ? <div style={styles.jarPercent}>{j.percent}% phần "Khác"</div> : <div style={styles.jarPercent}>&nbsp;</div>}
+            {j.percent ? <div style={styles.jarPercent}>{j.percent}% thu nhập còn lại</div> : <div style={styles.jarPercent}>&nbsp;</div>}
             <div style={{ ...styles.jarAmount, color: j.color }}>{fmt(balances[j.key])}</div>
           </div>
         ))}
       </div>
       <p style={styles.hint}>
-        Hũ "Khác" = Thu nhập − Chi tiêu hàng ngày đã khai báo. 5 hũ Tiết kiệm, Đầu tư, Ma chay, Chi tiêu, Từ thiện được chia ra từ hũ "Khác" theo tỉ lệ cố định.
+        Thu nhập còn lại (sau chi tiêu hàng ngày) tự động chia vào 5 hũ theo tỉ lệ. Bạn có thể điều chỉnh từng hũ khi nhập thu nhập.
       </p>
     </div>
   );
@@ -771,6 +774,21 @@ function EmptyState({ text }) {
   );
 }
 
+// Các hũ được chia từ phần "còn lại" (không tính daily)
+const SPLIT_JARS = [
+  { key: 'savings', label: 'Tiết kiệm', defaultPct: 0.30, color: '#0F6E56' },
+  { key: 'invest',  label: 'Đầu tư bản thân', defaultPct: 0.30, color: '#185FA5' },
+  { key: 'family',  label: 'Ma chay cưới hỏi', defaultPct: 0.15, color: '#993556' },
+  { key: 'spend',   label: 'Chi tiêu', defaultPct: 0.20, color: '#993C1D' },
+  { key: 'charity', label: 'Từ thiện', defaultPct: 0.05, color: '#534AB7' },
+];
+
+function buildDefaultAllocs(rest) {
+  const allocs = {};
+  SPLIT_JARS.forEach(j => { allocs[j.key] = Math.round(rest * j.defaultPct); });
+  return allocs;
+}
+
 function IncomeModal({ onClose, onSubmit }) {
   const [source, setSource] = useState('Lương');
   const [customLabel, setCustomLabel] = useState('');
@@ -779,16 +797,67 @@ function IncomeModal({ onClose, onSubmit }) {
   const [date, setDate] = useState(todayStr());
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
+  // allocEdits: { savings: string, invest: string, ... } — raw input strings
+  const [allocEdits, setAllocEdits] = useState(null);
 
   const amt = parseFloat(amount) || 0;
-  const daily = parseFloat(dailyAmount) || 0;
+  const daily = Math.min(parseFloat(dailyAmount) || 0, amt);
   const rest = Math.max(amt - daily, 0);
+
+  // Tự động tính phân bổ mặc định khi rest thay đổi — chỉ reset nếu người dùng chưa chỉnh
+  const prevRestRef = useRef(null);
+  useEffect(() => {
+    if (rest !== prevRestRef.current) {
+      prevRestRef.current = rest;
+      // Reset về mặc định khi tổng thu nhập / daily thay đổi
+      const defaults = buildDefaultAllocs(rest);
+      setAllocEdits(Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, String(v)])));
+    }
+  }, [rest]);
+
+  // Giá trị số thực từ allocEdits
+  const allocNums = allocEdits
+    ? Object.fromEntries(Object.entries(allocEdits).map(([k, v]) => [k, parseFloat(v) || 0]))
+    : buildDefaultAllocs(rest);
+
+  const allocTotal = Object.values(allocNums).reduce((s, v) => s + v, 0);
+  const allocDiff = rest - allocTotal; // dương = còn dư, âm = vượt quá
+
+  function handleAllocChange(key, val) {
+    setAllocEdits(prev => ({ ...prev, [key]: val }));
+  }
+
+  function resetAllocs() {
+    const defaults = buildDefaultAllocs(rest);
+    setAllocEdits(Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, String(v)])));
+  }
 
   function handleSubmit() {
     if (amt <= 0) { setError('Vui lòng nhập số tiền thu nhập lớn hơn 0.'); return; }
     if (daily > amt) { setError('Chi tiêu hàng ngày không được lớn hơn thu nhập.'); return; }
-    onSubmit({ source, customLabel, amount: amt, dailyAmount: daily, date, note });
+    if (Math.abs(allocDiff) > 1) {
+      setError(`Tổng phân bổ (${fmt(allocTotal)}) chưa bằng phần còn lại (${fmt(rest)}). Vui lòng điều chỉnh lại.`);
+      return;
+    }
+    // Xây dựng allocations đầy đủ (bao gồm other cho tương thích ngược)
+    const allocations = {
+      daily,
+      other: rest,
+      ...allocNums,
+    };
+    const tx = {
+      id: uid(),
+      type: 'income',
+      source: source === 'Khác' ? (customLabel || 'Khác') : source,
+      amount: amt,
+      date,
+      note,
+      allocations,
+    };
+    onSubmit({ source, customLabel, amount: amt, dailyAmount: daily, date, note, _allocations: allocations });
   }
+
+  const diffColor = Math.abs(allocDiff) <= 1 ? '#0F6E56' : '#993C1D';
 
   return (
     <ModalShell title="Thêm thu nhập" onClose={onClose} accent="#0F6E56">
@@ -817,7 +886,7 @@ function IncomeModal({ onClose, onSubmit }) {
           <input type="number" inputMode="numeric" min="0" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0" style={styles.input} />
         </Field>
 
-        <Field label="Chi tiêu hàng ngày dự kiến (trừ trước khỏi thu nhập)">
+        <Field label="Chi tiêu hàng ngày dự kiến (trừ trước)">
           <input type="number" inputMode="numeric" min="0" value={dailyAmount} onChange={e => setDailyAmount(e.target.value)} placeholder="0" style={styles.input} />
         </Field>
 
@@ -827,14 +896,48 @@ function IncomeModal({ onClose, onSubmit }) {
 
         {amt > 0 && (
           <div style={styles.previewBox}>
-            <div style={styles.previewTitle}>Phân bổ dự kiến</div>
-            <PreviewRow label="Chi tiêu hàng ngày" value={daily} color="#B45309" />
-            <PreviewRow label="Khác (còn lại)" value={rest} color="#5F5E5A" bold />
-            <PreviewRow label="— Tiết kiệm (30%)" value={rest * 0.3} color="#0F6E56" indent />
-            <PreviewRow label="— Đầu tư bản thân (30%)" value={rest * 0.3} color="#185FA5" indent />
-            <PreviewRow label="— Ma chay cưới hỏi (15%)" value={rest * 0.15} color="#993556" indent />
-            <PreviewRow label="— Chi tiêu (20%)" value={rest * 0.2} color="#993C1D" indent />
-            <PreviewRow label="— Từ thiện (5%)" value={rest * 0.05} color="#534AB7" indent />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <div style={styles.previewTitle}>Phân bổ vào các hũ</div>
+              <button type="button" onClick={resetAllocs} style={{ fontSize: 11.5, color: '#8A8478', background: 'none', border: '1px solid #E8E1D3', borderRadius: 6, padding: '3px 8px', cursor: 'pointer' }}>
+                Đặt lại mặc định
+              </button>
+            </div>
+
+            {/* Hũ chi tiêu hàng ngày — fixed, không chỉnh */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderBottom: '1px solid #F1EFE8', marginBottom: 6 }}>
+              <span style={{ fontSize: 13, color: '#B45309', fontWeight: 500 }}>Chi tiêu hàng ngày</span>
+              <span style={{ fontSize: 13, color: '#B45309', fontWeight: 600 }}>{fmt(daily)}</span>
+            </div>
+
+            {/* 5 hũ còn lại — có thể chỉnh */}
+            {SPLIT_JARS.map(j => (
+              <div key={j.key} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
+                <span style={{ flex: 1, fontSize: 13, color: '#5F5E5A' }}>{j.label}</span>
+                <span style={{ fontSize: 11, color: '#B4B2A9', minWidth: 32, textAlign: 'right' }}>
+                  {rest > 0 ? Math.round((allocNums[j.key] / rest) * 100) + '%' : ''}
+                </span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min="0"
+                  value={allocEdits ? allocEdits[j.key] : ''}
+                  onChange={e => handleAllocChange(j.key, e.target.value)}
+                  style={{ ...styles.input, width: 120, padding: '6px 8px', fontSize: 13, color: j.color, fontWeight: 600, textAlign: 'right' }}
+                />
+              </div>
+            ))}
+
+            {/* Tổng kiểm tra */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, paddingTop: 8, borderTop: '1px solid #E8E1D3' }}>
+              <span style={{ fontSize: 12.5, color: '#5F5E5A' }}>Còn lại để phân bổ</span>
+              <span style={{ fontSize: 13, color: diffColor, fontWeight: 600 }}>
+                {allocDiff === 0 ? '✓ Đủ' : allocDiff > 0 ? `+${fmt(allocDiff)} dư` : `${fmt(Math.abs(allocDiff))} thiếu`}
+              </span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: 12.5, color: '#5F5E5A' }}>Tổng cần phân bổ</span>
+              <span style={{ fontSize: 12.5, color: '#5F5E5A' }}>{fmt(rest)}</span>
+            </div>
           </div>
         )}
 
@@ -868,7 +971,7 @@ function ExpenseModal({ balances, onClose, onSubmit }) {
       <div>
         <Field label="Rút từ hũ nào">
           <div style={styles.jarSelectGrid}>
-            {JARS.map(j => (
+            {VISIBLE_JARS.map(j => (
               <button type="button" key={j.key} onClick={() => setJar(j.key)}
                 style={{ ...styles.jarSelectBtn, borderColor: jar === j.key ? j.color : j.ring, background: jar === j.key ? j.bg : '#fff' }}>
                 <span style={{ ...styles.jarSelectDot, background: j.color }} />
